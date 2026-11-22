@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}导入底表 · 科研支出万元公示{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>导入/替换底表</h1>
+  <p>CSV 首行为表头：第一格留空（或写“院系”），其后为支出科目；首列为院系名称，其余单元格填非负整数元。</p>
+  <ul class="hint">
+    <li>最多 20 行院系、10 列支出科目。</li>
+    <li>相同院系名或科目名不能重复；金额不接受小数、负号或千分位。</li>
+    <li>替换底表会清空现有公示表与锁定记录。</li>
+  </ul>
+  <pre class="sample">院系,设备费,差旅费,材料费
+物理学院,4500,5500,12000
+化学学院,5500,4500,8000</pre>
+  <form method="post" enctype="multipart/form-data" class="stack">
+    <input type="hidden" name="version" value="{{ statement.version if statement else '' }}">
+    <label>CSV 文件（UTF-8）<input type="file" name="csv" accept=".csv,text/csv" required></label>
+    <button type="submit">导入并生成公示表</button>
+  </form>
+  {% if statement %}
+  <p class="muted">当前报表版号 {{ statement.version }}（底表版号 {{ statement.base_version }}），共 {{ statement.rows|length }} 行 × {{ statement.cols|length }} 列。
+    已有 {% if statement.locks %}锁定 {{ statement.locks|length }} 行{% else %}无锁定行{% endif %}。</p>
+  {% endif %}
+</section>
+{% endblock %}

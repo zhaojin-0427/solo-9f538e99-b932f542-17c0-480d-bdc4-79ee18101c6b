@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}科研支出万元公示{% endblock %}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">科研支出万元公示</div>
+  <nav>
+    <a href="{{ url_for('statement_page') }}">公示表</a>
+    <a href="{{ url_for('upload_page') }}">导入/替换底表</a>
+  </nav>
+</header>
+<main>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+      <div class="flash {{ category }}" role="status">{{ message }}</div>
+    {% endfor %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</main>
+<footer>金额底表以元存储，公示表以万元展示；表格横加、竖加均与表内小计及总计一致。</footer>
+</body>
+</html>
