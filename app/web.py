@@ -107,6 +107,22 @@ def create_app(db_path: str | None = None) -> Flask:
         if stmt is None:
             return redirect(url_for("upload_page"))
         rows, cols = stmt["rows"], stmt["cols"]
+        try:
+            base_version = int(request.form.get("base_version", ""))
+        except (TypeError, ValueError):
+            base_version = None
+        if base_version is None:
+            flash("页面版号无效，请刷新页面后重新填写。", "error")
+            return render_template("correct.html", s=stmt, v=build_view(stmt),
+                                   form_values={}), 409
+        if base_version != stmt["base_version"]:
+            # 他人已更正或重传底表：先提示刷新，避免用旧表字段误报“金额非法”
+            flash("底表已被他人更正或重传，页面已过期，请刷新后重新填写。", "error")
+            fresh = load_statement(app.config["DB_PATH"])
+            form_values = {f"cell_{r.key}_{c.key}": str(fresh["base"][(r.key, c.key)])
+                           for r in fresh["rows"] for c in fresh["cols"]}
+            return render_template("correct.html", s=fresh, v=build_view(fresh),
+                                   form_values=form_values), 409
         cells = []
         error = None
         for r in rows:
@@ -129,18 +145,11 @@ def create_app(db_path: str | None = None) -> Flask:
             return render_template("correct.html", s=stmt, v=build_view(stmt),
                                    form_values=form_values), 400
         try:
-            base_version = int(request.form.get("base_version", ""))
-        except (TypeError, ValueError):
-            flash("页面版号无效，请刷新页面后重新填写。", "error")
-            fresh = load_statement(app.config["DB_PATH"])
-            return render_template("correct.html", s=fresh, v=build_view(fresh),
-                                   form_values=form_values), 409
-        try:
-            correct_statement(app.config["DB_PATH"], cells, base_version)
+            result = correct_statement(app.config["DB_PATH"], cells, base_version)
         except ConflictError as exc:
             flash(str(exc), "error")
             fresh = load_statement(app.config["DB_PATH"])
-            if exc.reason == "stale_base":
+            if exc.reason == "stale_base" or base_version != fresh["base_version"]:
                 # 底表已变：丢弃基于旧底表填写的内容，避免覆盖他人更正
                 form_values = {f"cell_{r.key}_{c.key}": str(fresh["base"][(r.key, c.key)])
                                for r in fresh["rows"] for c in fresh["cols"]}
@@ -161,7 +170,9 @@ def create_app(db_path: str | None = None) -> Flask:
             fresh = load_statement(app.config["DB_PATH"])
             return render_template("correct.html", s=fresh, v=build_view(fresh),
                                    form_values=form_values), 500
-        flash("更正已生效：底表与公示表已同时更新，锁定行保持原值。", "success")
+        flash("更正已生效：底表与公示表已同时更新，锁定行保持原值；"
+              f"公示表共 {result.get('changed_cells', 0)} 个院系×科目格相对更正前发生变化。",
+              "success")
         return redirect(url_for("statement_page"))
 
     @app.errorhandler(413)

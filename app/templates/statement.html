@@ -6,7 +6,8 @@
     <h1>科研支出公示表</h1>
     <span class="version">版号 {{ s.version }} · 底表版号 {{ s.base_version }}</span>
   </div>
-  <p class="muted">单位：万元。每格及行列小计按向上/向下取整，总计四舍五入；已锁定院系的公示值与小计保持原值。</p>
+  <p class="muted">单位：万元。每格及行列小计按向上/向下取整，总计四舍五入；已锁定院系的公示值与小计保持原值。
+    更正底表后，会在满足全部规则的前提下选择与上一版公示表交叉格改动最少的结果。</p>
   {% if v.display_ok and v.verified %}
     <div class="ok-banner">核对通过：各单元格、行小计、列小计与总计横竖加平均一致。</div>
   {% else %}

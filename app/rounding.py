@@ -7,14 +7,18 @@
 * 公示表必须横竖加平：行小计 = 该行单元格之和，列小计 = 该列单元格之和，
   总计 = 行小计之和 = 列小计之和。
 * 已锁定院系行的公示单元格与小计保持锁定时的原值。
+* 更正时若给出原公示表，则在全部合法解中取“院系 × 科目”交叉格改动数
+  最少的一张（行/列小计与总计不计入格数）。
 
-用带下界的可行流求一个满足全部约束的解（不是逐格独立四舍五入）。
+用带下界的可行流求满足全部约束的解（不是逐格独立四舍五入）；在可行流
+基础上用负环消去求改动格数最少的最小费用循环流。
 """
 from collections import deque
 
 UNIT = 10000
 
-__all__ = ["UNIT", "solve_display", "floor_wan", "ceil_wan", "round_wan"]
+__all__ = ["UNIT", "solve_display", "floor_wan", "ceil_wan", "round_wan",
+           "count_cell_changes"]
 
 
 def floor_wan(yuan: int) -> int:
@@ -39,6 +43,99 @@ class _Edge:
         self.cap = cap        # 剩余容量
         self.lower = lower
         self.initial = cap    # 加边时的容量（不含下界）
+
+
+class _CostEdge:
+    __slots__ = ("to", "rev", "cap", "cost")
+
+    def __init__(self, to, rev, cap, cost):
+        self.to = to
+        self.rev = rev
+        self.cap = cap
+        self.cost = cost
+
+
+class _CostGraph:
+    """残量网络；一对互为反向的弧，用于最小费用循环流。"""
+
+    def __init__(self, n):
+        self.n = n
+        self.graph = [[] for _ in range(n)]
+
+    def add_pair(self, u, v, cap_uv, cap_vu, cost_uv, cost_vu):
+        self.graph[u].append(_CostEdge(v, len(self.graph[v]), cap_uv, cost_uv))
+        self.graph[v].append(_CostEdge(u, len(self.graph[u]) - 1, cap_vu, cost_vu))
+        return u, len(self.graph[u]) - 1
+
+    def _find_negative_cycle(self):
+        """返回一条负环的边列表 [(u, edge_index), ...]；无负环返回 None。
+
+        以“虚拟源点向所有点连 0 费用边”等价于 dist 全 0 初始化，再用
+        Bellman–Ford 做 n 轮松弛：第 n 轮仍能松弛说明存在负环。
+        """
+        n = self.n
+        dist = [0] * n
+        pre_node = [-1] * n
+        pre_edge = [-1] * n
+        last = -1
+        for _ in range(n):
+            last = -1
+            for u in range(n):
+                du = dist[u]
+                for idx, e in enumerate(self.graph[u]):
+                    if e.cap > 0 and dist[e.to] > du + e.cost:
+                        dist[e.to] = du + e.cost
+                        pre_node[e.to] = u
+                        pre_edge[e.to] = idx
+                        last = e.to
+            if last == -1:
+                return None
+        # last 落在某个负环上；沿前驱回退 n 步必然仍在环内
+        v = last
+        for _ in range(n):
+            v = pre_node[v]
+        cycle = []
+        cur = v
+        while True:
+            cycle.append((pre_node[cur], pre_edge[cur]))
+            cur = pre_node[cur]
+            if cur == v:
+                break
+        return cycle
+
+    def cancel_negative_cycles(self):
+        """反复沿负环增广，直到残量网络无负环（即当前流费用最小）。"""
+        while True:
+            cycle = self._find_negative_cycle()
+            if cycle is None:
+                return
+            add = min(self.graph[u][idx].cap for u, idx in cycle)
+            for u, idx in cycle:
+                e = self.graph[u][idx]
+                e.cap -= add
+                self.graph[e.to][e.rev].cap += add
+
+
+def _min_cost_circulation(node_count, edges):
+    """带下界的最小费用循环流。
+
+    edges: (u, v, lower, upper, cost)。先用可行流求一组可行解，再沿残量
+    网络的负环增广到费用最小。返回每条边的流量；不可行返回 None。
+    """
+    plain = [(u, v, lo, hi) for u, v, lo, hi, _cost in edges]
+    flows = _feasible_circulation(node_count, plain)
+    if flows is None:
+        return None
+    g = _CostGraph(node_count)
+    refs = []
+    for (u, v, lo, hi, cost), f in zip(edges, flows):
+        # 正向残量 (u->v) 费用 cost，反向残量 (v->u) 费用 -cost
+        refs.append((u, g.add_pair(u, v, hi - f, f - lo, cost, -cost)[1], hi))
+    g.cancel_negative_cycles()
+    result = []
+    for u, idx, hi in refs:
+        result.append(hi - g.graph[u][idx].cap)
+    return result
 
 
 class _Dinic:
@@ -120,15 +217,42 @@ def _feasible_circulation(node_count, edges):
     return flows
 
 
+def count_cell_changes(P, previous):
+    """数“院系 × 科目”交叉格的改动数，不计行/列小计与总计。
+
+    P: 新公示矩阵（嵌套列表）。previous: {(row, col): 万元} 或其嵌套列表。
+    缺失的对侧格视为不同（计一处改动）。
+    """
+    if previous is None:
+        return 0
+    changes = 0
+    for i, row in enumerate(P):
+        for j, v in enumerate(row):
+            if isinstance(previous, dict):
+                old = previous.get((i, j))
+            else:
+                try:
+                    old = previous[i][j]
+                except (IndexError, KeyError, TypeError):
+                    old = None
+            if old != v:
+                changes += 1
+    return changes
+
+
 def _is_nonneg_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool) and v >= 0
 
 
-def solve_display(cells, locks=None):
+def solve_display(cells, locks=None, previous=None):
     """求一张满足取整与横竖加平的公示表。
 
     cells: R 行 C 列的非负整数元。
     locks: {row_index: (subtotal_wan, [cell_wan, ...])}，锁定原值。
+    previous: 可选，改动前公示表的“院系 × 科目”值（嵌套列表或
+        {(row_index, col_index): 万元}）。给出时在全部合法解中取交叉格
+        改动数最少的一张；只数院系与科目交叉处，不数小计/总计。
+        并列时结果确定（由算法固定选取，不引入随机）。
     返回 dict(P, rows, cols, total)；无解返回 None。
     """
     if not cells or not cells[0]:
@@ -211,7 +335,20 @@ def solve_display(cells, locks=None):
     if target_ups < 0 or target_ups > max_ups:
         return None
 
+    prev_map = {}
+    if previous is not None:
+        if isinstance(previous, dict):
+            prev_map = {(i, j): v for (i, j), v in previous.items()}
+        else:
+            try:
+                prev_map = {(i, j): previous[i][j]
+                            for i in range(len(previous)) for j in range(len(previous[i]))}
+            except (TypeError, IndexError):
+                prev_map = {}
+
     # 网络: 源 -> 行 -> 列 -> 汇，另加 汇->源 的精确“总向上取整格数”边。
+    # 给出 previous 时，每格的“上/下取整”按是否与改动前一致赋 0/1 费用，
+    # 求最小费用循环流即得交叉格改动数最少的一张表。
     S = 0
     row_node = {i: 1 + k for k, i in enumerate(unlocked_rows)}
     col_base = 1 + len(unlocked_rows)
@@ -223,24 +360,33 @@ def solve_display(cells, locks=None):
         hi = row_hi[i]
         if hi < 0 or lo > hi:
             return None
-        edges.append((S, row_node[i], lo, hi))
+        edges.append((S, row_node[i], lo, hi, 0))
     cell_edge_index = {}
     for i in unlocked_rows:
         for j in range(C):
             if rem[i][j] == 0:
                 continue
             cell_edge_index[(i, j)] = len(edges)
-            edges.append((row_node[i], col_base + j, 0, 1))
+            if previous is None:
+                cost = 0
+            else:
+                old = prev_map.get((i, j))
+                # 流量 1 表示向上取整。选上/下取整相对改动前是否变化，
+                # 折算为单条弧的单位费用（常数项不影响最优化）。
+                cost_down = 0 if old == base[i][j] else 1
+                cost_up = 0 if old == base[i][j] + 1 else 1
+                cost = cost_up - cost_down
+            edges.append((row_node[i], col_base + j, 0, 1, cost))
     for j in range(C):
         fsum = sum(base[i][j] for i in unlocked_rows)
         lo = col_lo[j] - fsum
         hi = col_hi[j] - fsum
         if hi < 0 or lo > hi:
             return None
-        edges.append((col_base + j, T, max(0, lo), hi))
-    edges.append((T, S, target_ups, target_ups))
+        edges.append((col_base + j, T, max(0, lo), hi, 0))
+    edges.append((T, S, target_ups, target_ups, 0))
 
-    flows = _feasible_circulation(node_count, edges)
+    flows = _min_cost_circulation(node_count, edges)
     if flows is None:
         return None
 
@@ -250,8 +396,9 @@ def solve_display(cells, locks=None):
     for i in unlocked_rows:
         for j in range(C):
             P[i][j] = base[i][j]
-            if rem[i][j] > 0:
-                P[i][j] += flows[cell_edge_index[(i, j)]]
+    for (i, j), idx in cell_edge_index.items():
+        if flows[idx]:
+            P[i][j] += 1
 
     rows = [sum(r) for r in P]
     cols = [sum(P[i][j] for i in range(R)) for j in range(C)]

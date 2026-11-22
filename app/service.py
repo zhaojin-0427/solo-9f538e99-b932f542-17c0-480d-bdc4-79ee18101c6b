@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import inspect
 import json
 import sqlite3
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 from .db import connect, now_iso
-from .rounding import ceil_wan, floor_wan, round_wan, solve_display
+from .rounding import ceil_wan, count_cell_changes, floor_wan, round_wan, solve_display
 
 
 class AppError(Exception):
@@ -210,6 +211,7 @@ def upload_statement(db_path: str, row_labels, col_labels, amounts,
         raise ValidationError("数据行数与院系数不一致。")
     validate_cells(amounts, len(row_labels), len(col_labels))
 
+    # 新建/替换底表不沿用旧公示表，无“最少改动”目标
     solution = solve_display(amounts, {})
     if solution is None:
         raise InfeasibleError("该底表无法生成行列都加平的万元公示表，未保存。")
@@ -303,9 +305,22 @@ def _snapshot(db_path: str):
         rows = _read_rows(conn)
         cols = _read_cols(conn)
         locks = _read_locks(conn)
-        return version, base_version, rows, cols, locks
+        public = _public_matrix(conn, rows, cols)
+        previous = [[public[(r.key, c.key)] for c in cols] for r in rows]
+        return version, base_version, rows, cols, locks, previous
     finally:
         conn.close()
+
+
+def _accepts_previous(compute: Callable) -> bool:
+    """判断计算函数是否接受 previous= 关键字（便于测试替换慢/包装实现）。"""
+    try:
+        params = inspect.signature(compute).parameters
+    except (TypeError, ValueError):
+        return False
+    if "previous" in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def _lock_signature(locks):
@@ -316,26 +331,34 @@ def correct_statement(db_path: str, cells, expected_base_version: int,
                       compute: Callable = solve_display, max_attempts: int = 5):
     """更正底表并按最新锁定重算公示表。
 
+    沿用原有取整、横竖加平与锁定规则；在全部合法公示表中取与“更正前”
+    公示表相比“院系 × 科目”交叉格改动数最少的一张（不计小计/总计），
+    尽量少让院系重核。
+
     计算在写事务之外完成，期间其他请求仍可锁定。
     提交前用底表版号 + 锁定快照做乐观校验；遇到新锁定会按最新锁定重算后重试。
     底表与公示表在同一事务写入，失败/无解均保持原样。
     """
     for _attempt in range(max_attempts):
-        version, base_version, rows, cols, locks = _snapshot(db_path)
+        version, base_version, rows, cols, locks, previous = _snapshot(db_path)
         if version == 0 or not rows:
             raise ConflictError("报表不存在，请刷新页面。")
         if base_version != expected_base_version:
-            raise ConflictError("底表已被他人更正，页面已过期，请刷新后重新填写。",
+            raise ConflictError("底表已被他人更正或重传，页面已过期，请刷新后重新填写。",
                                 reason="stale_base")
         row_keys = [r.key for r in rows]
         col_keys = [c.key for c in cols]
         validate_cells(cells, len(row_keys), len(col_keys))
         lock_map = {i: (locks[r.key]["subtotal"], locks[r.key]["cells"])
                     for i, r in enumerate(rows) if r.key in locks}
-        solution = compute(cells, lock_map)
+        if _accepts_previous(compute):
+            solution = compute(cells, lock_map, previous=previous)
+        else:
+            # 兼容只接收 (cells, locks) 的旧式计算函数（如测试里的包装）
+            solution = compute(cells, lock_map)
         if solution is None:
             # 可能是并发锁定导致，确认版本未变后再判定无解
-            v2, b2, _, _, _ = _snapshot(db_path)
+            v2, b2, *_ = _snapshot(db_path)
             if v2 != version or b2 != base_version:
                 continue
             raise InfeasibleError(
@@ -347,10 +370,10 @@ def correct_statement(db_path: str, cells, expected_base_version: int,
             try:
                 version2, base_version2 = _meta(conn)
                 if base_version2 != base_version:
-                    raise ConflictError("底表已被他人更正，页面已过期，请刷新后重新填写。",
+                    raise ConflictError("底表已被他人更正或重传，页面已过期，请刷新后重新填写。",
                                         reason="stale_base")
                 if version2 != version:
-                    # 计算期间有新锁定（或其它变更）：回滚，按最新锁定重算
+                    # 计算期间有新锁定（或其它变更）：回滚，按最新锁定重新求最少改动
                     conn.execute("ROLLBACK")
                     continue
                 locks2 = _read_locks(conn)
@@ -362,9 +385,16 @@ def correct_statement(db_path: str, cells, expected_base_version: int,
                 if ([r.key for r in rows2] != row_keys or
                         [c.key for c in cols2] != col_keys):
                     raise ConflictError("院系或支出科目已变化，请刷新页面。")
+                public2 = _public_matrix(conn, rows2, cols2)
+                previous2 = [[public2[(r.key, c.key)] for c in cols2] for r in rows2]
+                if previous2 != previous:
+                    # 公示表在计算期间被改动，目标已变：按最新公示表重新求最少改动
+                    conn.execute("ROLLBACK")
+                    continue
+                changed = count_cell_changes(solution["P"], previous)
                 _write_statement(conn, rows2, cols2, cells, solution, bump_base=True)
                 conn.execute("COMMIT")
-                return {"version": version + 1}
+                return {"version": version + 1, "changed_cells": changed}
             except BaseException:
                 if conn.in_transaction:
                     conn.execute("ROLLBACK")

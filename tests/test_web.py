@@ -485,3 +485,162 @@ def test_upload_too_large_redirects(client):
     resp = client.post("/upload", data={"csv": (io.BytesIO(big), "big.csv")},
                        content_type="multipart/form-data", follow_redirects=True)
     assert "上传文件过大" in resp.get_data(as_text=True)
+
+
+def test_correction_publishes_minimal_cross_cell_changes(db_path):
+    """更正后公示表应与更正前相比交叉格改动最少，并在结果中报告格数。"""
+    app = create_app(db_path)
+    csv = ("院系,设备,差旅\n"
+           "一,4500,4500\n"
+           "二,5500,5500\n"
+           "三,5500,5500\n").encode()
+    with app.test_client() as c:
+        c.post("/upload", data={"csv": (io.BytesIO(csv), "a.csv")},
+               content_type="multipart/form-data")
+    stmt = load_statement(db_path)
+    prev = {(r.key, c.key): stmt["public"][(r.key, c.key)]
+            for r in stmt["rows"] for c in stmt["cols"]}
+
+    cells = [[stmt["base"][(r.key, c.key)] for c in stmt["cols"]] for r in stmt["rows"]]
+    cells[2][0] += 4000
+    result = correct_statement(db_path, cells, stmt["base_version"])
+    new = load_statement(db_path)
+
+    from app.rounding import count_cell_changes
+    from app.service import _lock_signature
+    cur = [[new["public"][(r.key, c.key)] for c in new["cols"]] for r in new["rows"]]
+    old = [[prev[(r.key, c.key)] for c in new["cols"]] for r in new["rows"]]
+    assert new["verified"] is True
+    assert result["changed_cells"] == count_cell_changes(cur, old)
+    assert result["changed_cells"] <= 1
+    # 小计/总计不计入格数：这里只改一格公示值
+    assert sum(c != o for r_c, r_o in zip(cur, old) for c, o in zip(r_c, r_o)) <= 1
+
+
+def test_correction_with_multiple_optima_keeps_previous_where_possible(db_path):
+    """存在多张合法结果时，取与上一版最接近的一张（0 改动）。"""
+    app = create_app(db_path)
+    csv = ("院系,设备,差旅\n"
+           "一,4500,4500\n"
+           "二,5500,5500\n"
+           "三,5500,5500\n").encode()
+    with app.test_client() as c:
+        c.post("/upload", data={"csv": (io.BytesIO(csv), "a.csv")},
+               content_type="multipart/form-data")
+    stmt = load_statement(db_path)
+    prev = {(r.key, c.key): stmt["public"][(r.key, c.key)]
+            for r in stmt["rows"] for c in stmt["cols"]}
+
+    # +1 元不改变总计，存在多张合法表；应保留原公示表
+    cells = [[stmt["base"][(r.key, c.key)] for c in stmt["cols"]] for r in stmt["rows"]]
+    cells[2][0] += 1
+    result = correct_statement(db_path, cells, stmt["base_version"])
+    new = load_statement(db_path)
+    assert result["changed_cells"] == 0
+    for r in new["rows"]:
+        for c in new["cols"]:
+            assert new["public"][(r.key, c.key)] == prev[(r.key, c.key)]
+    assert new["verified"] is True
+
+
+def test_new_lock_during_computation_recomputes_minimal_changes(db_path):
+    """算表期间新增锁定：先保存锁定，再按最新锁定重新求最少改动。"""
+    app = create_app(db_path)
+    csv = ("院系,设备,差旅\n"
+           "一,4500,4500\n"
+           "二,5500,5500\n"
+           "三,5500,5500\n").encode()
+    with app.test_client() as c:
+        c.post("/upload", data={"csv": (io.BytesIO(csv), "a.csv")},
+               content_type="multipart/form-data")
+    stmt = load_statement(db_path)
+    prev = {(r.key, c.key): stmt["public"][(r.key, c.key)]
+            for r in stmt["rows"] for c in stmt["cols"]}
+
+    from app.rounding import solve_display
+
+    calls = {"n": 0}
+
+    def compute(cells, locks, previous=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # 第一次核算期间，另一请求按“更正前”公示表锁定第二行
+            lock_row(db_path, "r2", load_statement(db_path)["version"])
+        return solve_display(cells, locks, previous=previous)
+
+    cells = [[stmt["base"][(r.key, c.key)] for c in stmt["cols"]] for r in stmt["rows"]]
+    cells[2][0] += 1
+    result = correct_statement(db_path, cells, stmt["base_version"], compute=compute)
+    new = load_statement(db_path)
+    assert calls["n"] == 2  # 新锁定触发一次重算
+    assert result["changed_cells"] == 0
+    assert "r2" in new["locks"]
+    assert [new["public"][("r2", c.key)] for c in new["cols"]] == \
+        [prev[("r2", c.key)] for c in new["cols"]]
+    for r in new["rows"]:
+        for c in new["cols"]:
+            assert new["public"][(r.key, c.key)] == prev[(r.key, c.key)]
+    assert new["verified"] is True
+    # 锁定行保持锁定原值
+    assert new["row_totals"]["r2"] == new["locks"]["r2"]["subtotal"]
+
+
+def test_upload_new_base_after_correction_starts_fresh(db_path):
+    """他人先更正或重传底表：旧页面的更正提示刷新；重传后按新底表重建公示表。"""
+    app = create_app(db_path)
+    csv = ("院系,设备,差旅\n"
+           "甲,4500,4500\n"
+           "乙,5500,5500\n").encode()
+    with app.test_client() as c:
+        c.post("/upload", data={"csv": (io.BytesIO(csv), "a.csv")},
+               content_type="multipart/form-data")
+    old = load_statement(db_path)
+    form = _form_from_stmt(old)
+    # 他人先重传了底表
+    new_csv = ("院系,设备,差旅\n"
+               "甲,4500,4500\n"
+               "乙,5500,5500\n"
+               "丙,10000,0\n").encode()
+    with app.test_client() as c:
+        c.post("/upload", data={"csv": (io.BytesIO(new_csv), "b.csv"),
+                                "version": str(old["version"])},
+               content_type="multipart/form-data")
+    # 旧页面提交更正：应提示刷新，且不写入
+    before = load_statement(db_path)
+    resp = app.test_client().post("/correct", data=form)
+    assert resp.status_code == 409
+    assert "刷新" in resp.get_data(as_text=True)
+    after = load_statement(db_path)
+    assert (dict(after["base"]), after["base_version"], after["version"]) == \
+        (dict(before["base"]), before["base_version"], before["version"])
+
+
+def test_lock_before_submit_is_used_for_minimal_changes(db_path):
+    """页面打开后、提交前他人锁定一行：底表版号未变，更正应以最新锁定求最少改动。"""
+    app = create_app(db_path)
+    csv = ("院系,设备,差旅\n"
+           "一,4500,4500\n"
+           "二,5500,5500\n"
+           "三,5500,5500\n").encode()
+    with app.test_client() as c:
+        c.post("/upload", data={"csv": (io.BytesIO(csv), "a.csv")},
+               content_type="multipart/form-data")
+    stmt = load_statement(db_path)
+    prev = {(r.key, c.key): stmt["public"][(r.key, c.key)]
+            for r in stmt["rows"] for c in stmt["cols"]}
+    # 页面打开时看到的是 base_version；随后他人按当前所见版锁定 r2
+    lock_row(db_path, "r2", stmt["version"])
+    form = _form_from_stmt(load_statement(db_path), {("r3", "c1"): 5501})
+    resp = app.test_client().post("/correct", data=form,
+                                  follow_redirects=True)
+    assert "更正已生效" in resp.get_data(as_text=True)
+    new = load_statement(db_path)
+    # 锁定行仍保持锁定原值
+    assert [new["public"][("r2", c.key)] for c in new["cols"]] == \
+        [prev[("r2", c.key)] for c in new["cols"]]
+    assert new["row_totals"]["r2"] == new["locks"]["r2"]["subtotal"]
+    # 其它交叉格尽量不变
+    changed = [(r.key, c.key) for r in new["rows"] for c in new["cols"]
+               if new["public"][(r.key, c.key)] != prev[(r.key, c.key)]]
+    assert changed == []
+    assert new["verified"] is True

@@ -1,7 +1,8 @@
 import itertools
 import random
 
-from app.rounding import ceil_wan, floor_wan, round_wan, solve_display
+from app.rounding import (ceil_wan, count_cell_changes, floor_wan, round_wan,
+                          solve_display)
 
 
 def brute_force(cells, locks=None):
@@ -161,3 +162,70 @@ def test_max_size_table_is_fast():
     sol = solve_display(cells)
     assert sol is not None
     assert_valid(cells, {}, sol)
+
+
+def test_min_changes_matches_bruteforce_when_previous_given():
+    """给出更正前公示表时，解应是全部合法解中交叉格改动最少的。"""
+    rng = random.Random(13)
+    vals = [0, 2500, 4500, 5000, 5500, 7500, 9999, 10000, 10001, 19999, 25000]
+    for R, C in [(1, 2), (2, 2), (2, 3), (3, 3)]:
+        for _ in range(200):
+            cells = [[rng.choice(vals) for _ in range(C)] for _ in range(R)]
+            previous = [[rng.choice([0, 1, 2, 3, 4]) for _ in range(C)] for _ in range(R)]
+            locks = {}
+            if rng.random() < 0.4:
+                base = solve_display(cells)
+                i = rng.randrange(R)
+                locks = {i: (base["rows"][i], base["P"][i][:])}
+            legal = brute_force(cells, locks)
+            got = solve_display(cells, locks, previous=previous)
+            assert bool(legal) == bool(got), (cells, previous, locks)
+            if not legal:
+                continue
+            assert_valid(cells, locks, got)
+            best = min(count_cell_changes(P, previous) for P in legal)
+            assert count_cell_changes(got["P"], previous) == best, (
+                cells, previous, locks, got["P"])
+
+
+def test_previous_legal_solution_is_kept_changed_zero():
+    """原公示表本身合法时，最少改动结果应原样保留（0 格改动）。"""
+    cells = [[5000, 5000], [5000, 5000]]
+    legal = [[[0, 1], [1, 0]], [[1, 0], [0, 1]]]
+    for previous in legal:
+        sol = solve_display(cells, previous=previous)
+        assert sol["P"] == previous
+        assert count_cell_changes(sol["P"], previous) == 0
+
+
+def test_min_changes_respects_locks_preferring_other_cells():
+    """锁定行保持原值，最少改动只在未锁定的交叉格上取舍。"""
+    cells = [[4500, 4500], [5500, 5500]]
+    base = solve_display(cells)
+    lock = {0: (base["rows"][0], base["P"][0][:])}
+    previous = [[0, 1], [0, 1]]
+    sol = solve_display(cells, lock, previous=previous)
+    assert sol["P"][0] == base["P"][0]
+    # 锁定行保持不变；其余行取与 previous 贴合、且满足加平的方案
+    legal = brute_force(cells, lock)
+    best = min(count_cell_changes(P, previous) for P in legal)
+    assert count_cell_changes(sol["P"], previous) == best
+    assert count_cell_changes(sol["P"], previous) < len(previous) * len(previous[0])
+
+
+def test_min_changes_counts_only_cross_cells():
+    """改动计数只针对院系×科目交叉格，不受小计/总计影响。"""
+    P = [[1, 0], [0, 1]]
+    previous = {**{(0, 0): 1, (0, 1): 0, (1, 0): 0, (1, 1): 0}}
+    assert count_cell_changes(P, previous) == 1  # 只有 (1,1) 变了
+
+
+def test_min_changes_deterministic_and_valid_for_many_optima():
+    """存在多张合法结果时，同一输入重复求解应得到同一张表。"""
+    cells = [[5000, 5000], [5000, 5000]]
+    previous = [[0, 1], [1, 0]]
+    first = solve_display(cells, previous=previous)
+    for _ in range(10):
+        again = solve_display(cells, previous=previous)
+        assert again["P"] == first["P"]
+    assert first["P"] == previous
