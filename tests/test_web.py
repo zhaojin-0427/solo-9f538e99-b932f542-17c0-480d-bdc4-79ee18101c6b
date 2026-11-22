@@ -214,7 +214,7 @@ def test_lock_succeeds_while_correction_is_computing(db_path):
 
     from app.rounding import solve_display
 
-    def slow_compute(cells, locks):
+    def slow_compute(cells, locks, previous=None):
         started.set()
         assert release.wait(5)
         return solve_display(cells, locks)
@@ -283,7 +283,7 @@ def test_repeated_interleaved_locks_end_with_retry_message(db_path):
 
     counter = {"n": 0}
 
-    def compute(cells, locks):
+    def compute(cells, locks, previous=None):
         # 每次核算都模拟另一请求抢先锁定一个新行
         key = f"r{counter['n'] + 1}"
         counter["n"] += 1
@@ -351,7 +351,7 @@ def test_lock_during_computation_is_picked_up(db_path):
     original = {(r.key, c.key): stmt["public"][(r.key, c.key)] for r in stmt["rows"]
                 for c in stmt["cols"]}
 
-    def interleaved_compute(cells, locks):
+    def interleaved_compute(cells, locks, previous=None):
         # 第一次核算时，模拟并发锁定（锁定第 1 行按当前所见值）
         if not getattr(interleaved_compute, "locked", False):
             interleaved_compute.locked = True
@@ -390,7 +390,7 @@ def test_interleaved_lock_makes_correction_infeasible_and_rolls_back(db_path):
 
     from app.rounding import solve_display
 
-    def compute(cells, locks):
+    def compute(cells, locks, previous=None):
         if not getattr(compute, "did_lock", False):
             compute.did_lock = True
             # 用“更正前”的表锁定第一行
@@ -467,7 +467,7 @@ def test_lock_wins_before_and_correction_retries_or_reports(db_path, monkeypatch
     real_compute = service.solve_display
     calls = {"n": 0}
 
-    def compute(cells, locks):
+    def compute(cells, locks, previous=None):
         calls["n"] += 1
         return real_compute(cells, locks)
 
@@ -485,3 +485,120 @@ def test_upload_too_large_redirects(client):
     resp = client.post("/upload", data={"csv": (io.BytesIO(big), "big.csv")},
                        content_type="multipart/form-data", follow_redirects=True)
     assert "上传文件过大" in resp.get_data(as_text=True)
+
+
+def test_correction_publishes_minimum_changed_cells(db_path):
+    """存在多张合法公示表时，更正应发布与更正前交叉格改动最少的一版。"""
+    from app.rounding import solve_min_change
+
+    app = create_app(db_path)
+    # 两行两列，取整后存在多种横竖加平方案
+    csv = ("院系,设备,差旅\n"
+           "甲,4500,5500\n"
+           "乙,5500,4500\n").encode()
+    with app.test_client() as c:
+        c.post("/upload", data={"csv": (io.BytesIO(csv), "a.csv")},
+               content_type="multipart/form-data")
+    stmt = load_statement(db_path)
+    before_public = {(r.key, c.key): stmt["public"][(r.key, c.key)]
+                     for r in stmt["rows"] for c in stmt["cols"]}
+    prev_matrix = [[stmt["public"][(r.key, c.key)] for c in stmt["cols"]]
+                   for r in stmt["rows"]]
+
+    # 底表改为另一组仍有多解的金额
+    new_cells = [[4500, 4500], [4500, 4500]]
+    result = correct_statement(
+        db_path, new_cells, stmt["base_version"])
+    after = load_statement(db_path)
+    assert after["verified"] is True
+
+    # 服务端求解器给出的最少改动数
+    lock_map = {}
+    expected = solve_min_change(new_cells, lock_map, prev_matrix)
+    assert result["changes"] == expected["changes"]
+    actual_changes = sum(
+        1 for r in stmt["rows"] for c in stmt["cols"]
+        if after["public"][(r.key, c.key)] != before_public[(r.key, c.key)])
+    assert actual_changes == expected["changes"]
+    # 格数只数交叉格：行/列小计随交叉格派生，不另计入 changes
+    assert 0 <= result["changes"] <= len(stmt["rows"]) * len(stmt["cols"])
+
+
+def test_correction_flash_reports_change_count(client, db_path):
+    """页面提示本次更正的交叉格改动数（含最少改动说明）。"""
+    stmt = load_statement(db_path)
+    # 改动一个可上可取的格，迫使取整方案重新分配，产生至少 1 格交叉格改动
+    form = _form_from_stmt(stmt, {("r1", "c1"): 9900})
+    resp = client.post("/correct", data=form, follow_redirects=True)
+    assert resp.status_code == 200
+    html = resp.get_data(as_text=True)
+    assert "更正已生效" in html
+    after = load_statement(db_path)
+    changed = sum(
+        1 for r in stmt["rows"] for c in stmt["cols"]
+        if after["public"][(r.key, c.key)] != stmt["public"][(r.key, c.key)])
+    if changed:
+        assert "改动最少" in html and "交叉格共改动" in html
+        assert f"共改动 {changed} 格" in html
+    else:
+        assert "零格改动" in html
+
+
+def test_correction_zero_change_when_rounding_unchanged(client, db_path):
+    """底表金额变化但万元取整结果不变时，公示表可零格改动。"""
+    stmt = load_statement(db_path)
+    # 4500 -> 4600 仍取下整 0 万元，公示值无需变化
+    key = ("r1", "c1")
+    old = stmt["base"][key]
+    form = _form_from_stmt(stmt, {key: old + 100})
+    resp = client.post("/correct", data=form, follow_redirects=True)
+    assert "零格改动" in resp.get_data(as_text=True)
+    after = load_statement(db_path)
+    for r in stmt["rows"]:
+        for c in stmt["cols"]:
+            assert after["public"][(r.key, c.key)] == stmt["public"][(r.key, c.key)]
+
+
+def test_min_change_recomputed_against_latest_lock_during_computation(db_path):
+    """算表期间新增锁定先保存：按最新锁定重新求最少改动，锁定行保持原值。"""
+    app = create_app(db_path)
+    csv = ("院系,设备,差旅\n"
+           "一,4500,4500\n"
+           "二,5500,5500\n"
+           "三,5500,5500\n").encode()
+    with app.test_client() as c:
+        c.post("/upload", data={"csv": (io.BytesIO(csv), "a.csv")},
+               content_type="multipart/form-data")
+    stmt = load_statement(db_path)
+    original = {(r.key, c.key): stmt["public"][(r.key, c.key)]
+                for r in stmt["rows"] for c in stmt["cols"]}
+
+    def interleaved(cells, locks, previous=None):
+        if not getattr(interleaved, "locked", False):
+            interleaved.locked = True
+            lock_row(db_path, "r1", load_statement(db_path)["version"])
+        from app.rounding import solve_min_change
+        return solve_min_change(cells, locks, previous)
+
+    cells = [[stmt["base"][(r.key, c.key)] for c in stmt["cols"]] for r in stmt["rows"]]
+    cells[0][0] = 5000
+    result = correct_statement(db_path, cells, stmt["base_version"],
+                               compute=interleaved)
+    after = load_statement(db_path)
+    assert after["verified"] is True
+    assert "r1" in after["locks"]
+    # 锁定行的公示值来自更正前的表且被完整保留
+    assert [after["public"][("r1", c.key)] for c in after["cols"]] == \
+        [original[("r1", c.key)] for c in stmt["cols"]]
+    assert result["changes"] >= 0
+
+
+def test_stale_base_correction_still_prompts_refresh(client, db_path):
+    """他人先更正或重传底表：版号过期，提示刷新且不落库。"""
+    stmt = load_statement(db_path)
+    form = _form_from_stmt(stmt, {("r1", "c1"): 5000})
+    form["base_version"] = str(stmt["base_version"] - 1)
+    resp = client.post("/correct", data=form)
+    assert resp.status_code == 409
+    assert "刷新" in resp.get_data(as_text=True)
+    assert load_statement(db_path)["base"][("r1", "c1")] == stmt["base"][("r1", "c1")]

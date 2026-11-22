@@ -136,7 +136,7 @@ def create_app(db_path: str | None = None) -> Flask:
             return render_template("correct.html", s=fresh, v=build_view(fresh),
                                    form_values=form_values), 409
         try:
-            correct_statement(app.config["DB_PATH"], cells, base_version)
+            result = correct_statement(app.config["DB_PATH"], cells, base_version)
         except ConflictError as exc:
             flash(str(exc), "error")
             fresh = load_statement(app.config["DB_PATH"])
@@ -161,7 +161,16 @@ def create_app(db_path: str | None = None) -> Flask:
             fresh = load_statement(app.config["DB_PATH"])
             return render_template("correct.html", s=fresh, v=build_view(fresh),
                                    form_values=form_values), 500
-        flash("更正已生效：底表与公示表已同时更新，锁定行保持原值。", "success")
+        changes = result.get("changes")
+        if changes is None:
+            flash("更正已生效：底表与公示表已同时更新，锁定行保持原值。", "success")
+        elif changes == 0:
+            flash("更正已生效：底表与公示表已同时更新；沿用取整规则后公示表零格改动，院系无需重新核对。",
+                  "success")
+        else:
+            flash(f"更正已生效：底表与公示表已同时更新，锁定行保持原值。"
+                  f"已在全部合法结果中选择改动最少的一版，院系×科目交叉格共改动 {changes} 格"
+                  f"（行列小计与总计不计格数）。", "success")
         return redirect(url_for("statement_page"))
 
     @app.errorhandler(413)

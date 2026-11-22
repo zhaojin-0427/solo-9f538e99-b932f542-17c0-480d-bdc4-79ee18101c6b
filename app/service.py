@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from .db import connect, now_iso
-from .rounding import ceil_wan, floor_wan, round_wan, solve_display
+from .rounding import ceil_wan, floor_wan, round_wan, solve_display, solve_min_change
+
+
+def _default_compute(cells, locks, previous=None):
+    """更正默认求解：沿用取整/加平/锁定规则，求与更正前公示表改动最少的方案。"""
+    return solve_min_change(cells, locks, previous)
 
 
 class AppError(Exception):
@@ -303,7 +308,8 @@ def _snapshot(db_path: str):
         rows = _read_rows(conn)
         cols = _read_cols(conn)
         locks = _read_locks(conn)
-        return version, base_version, rows, cols, locks
+        public = _public_matrix(conn, rows, cols)
+        return version, base_version, rows, cols, locks, public
     finally:
         conn.close()
 
@@ -313,15 +319,17 @@ def _lock_signature(locks):
 
 
 def correct_statement(db_path: str, cells, expected_base_version: int,
-                      compute: Callable = solve_display, max_attempts: int = 5):
+                      compute: Callable = _default_compute, max_attempts: int = 5):
     """更正底表并按最新锁定重算公示表。
 
     计算在写事务之外完成，期间其他请求仍可锁定。
+    核算沿用现有取整、横竖加平与锁定规则，并在所有合法方案中发布与更正前
+    公示表相比“院系 × 科目”交叉格改动最少的结果（小计与总计不计格数）。
     提交前用底表版号 + 锁定快照做乐观校验；遇到新锁定会按最新锁定重算后重试。
     底表与公示表在同一事务写入，失败/无解均保持原样。
     """
     for _attempt in range(max_attempts):
-        version, base_version, rows, cols, locks = _snapshot(db_path)
+        version, base_version, rows, cols, locks, public = _snapshot(db_path)
         if version == 0 or not rows:
             raise ConflictError("报表不存在，请刷新页面。")
         if base_version != expected_base_version:
@@ -332,10 +340,11 @@ def correct_statement(db_path: str, cells, expected_base_version: int,
         validate_cells(cells, len(row_keys), len(col_keys))
         lock_map = {i: (locks[r.key]["subtotal"], locks[r.key]["cells"])
                     for i, r in enumerate(rows) if r.key in locks}
-        solution = compute(cells, lock_map)
+        previous = [[public[(r.key, c.key)] for c in cols] for r in rows]
+        solution = compute(cells, lock_map, previous)
         if solution is None:
             # 可能是并发锁定导致，确认版本未变后再判定无解
-            v2, b2, _, _, _ = _snapshot(db_path)
+            v2, b2, _, _, _, _ = _snapshot(db_path)
             if v2 != version or b2 != base_version:
                 continue
             raise InfeasibleError(
@@ -364,7 +373,10 @@ def correct_statement(db_path: str, cells, expected_base_version: int,
                     raise ConflictError("院系或支出科目已变化，请刷新页面。")
                 _write_statement(conn, rows2, cols2, cells, solution, bump_base=True)
                 conn.execute("COMMIT")
-                return {"version": version + 1}
+                return {
+                    "version": version + 1,
+                    "changes": solution.get("changes"),
+                }
             except BaseException:
                 if conn.in_transaction:
                     conn.execute("ROLLBACK")
