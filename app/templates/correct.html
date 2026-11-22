@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}更正底表 · 科研支出万元公示{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="headline">
+    <h1>更正底表数据</h1>
+    <span class="version">版号 {{ s.version }} · 底表版号 {{ s.base_version }}</span>
+  </div>
+  <p class="muted">单位：元。更正后按最新锁定记录重新核算公示表；该次更正成功则底表与公示表一起生效，
+    无解或保存失败则两表都保持原样。已锁定院系的公示值及小计保持原值。</p>
+  {% if s.locks %}
+  <p class="hint">当前已锁定 {{ s.locks|length }} 行：{% for k, l in s.locks.items() %}{{ l.row_label }}{% if not loop.last %}、{% endif %}{% endfor %}。
+    这些行的行内金额仍可改动底表，但公示值与行小计不会变化。</p>
+  {% endif %}
+  <form method="post" action="{{ url_for('correct') }}">
+    <input type="hidden" name="base_version" value="{{ s.base_version }}">
+    <div class="table-wrap">
+    <table class="grid edit">
+      <thead>
+        <tr>
+          <th class="corner">院系 \ 科目</th>
+          {% for c in v.cols %}<th>{{ c.label }}</th>{% endfor %}
+          <th class="total-col">行小计</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in v.matrix %}
+        <tr class="{{ 'locked' if row.locked }}">
+          <th class="rowhead">{{ row.label }}{% if row.locked %}<span class="badge">已锁定</span>{% endif %}</th>
+          {% for cell in row.cells %}
+          <td>
+            <input class="num-input" type="number" min="0" step="1" required
+                   name="cell_{{ row.key }}_{{ cell.col.key }}"
+                   value="{{ form_values.get('cell_' ~ row.key ~ '_' ~ cell.col.key, cell.base) }}"
+                   aria-label="{{ row.label }} {{ cell.col.label }} 金额（元）">
+            <div class="was">现公示 {{ cell.value }} 万元</div>
+          </td>
+          {% endfor %}
+          <td class="num subtotal">{{ row.subtotal }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+      <tfoot>
+        <tr>
+          <th class="rowhead">列小计</th>
+          {% for val in v.col_totals %}<td class="num subtotal">{{ val }}</td>{% endfor %}
+          <td class="num grand">{{ v.total }}</td>
+        </tr>
+      </tfoot>
+    </table>
+    </div>
+    <div class="actions">
+      <button type="submit">保存更正</button>
+      <a class="button secondary" href="{{ url_for('statement_page') }}">取消</a>
+    </div>
+  </form>
+</section>
+{% endblock %}

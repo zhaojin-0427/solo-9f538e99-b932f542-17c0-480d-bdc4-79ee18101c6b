@@ -1,0 +1,17 @@
+services:
+  finance:
+    build: .
+    image: research-finance-disclosure:latest
+    init: true
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/finance.sqlite3
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+      SEED_SAMPLE: ${SEED_SAMPLE:-0}
+    volumes:
+      - finance-data:/data
+    restart: unless-stopped
+
+volumes:
+  finance-data:

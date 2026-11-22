@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}公示表 · 科研支出万元公示{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="headline">
+    <h1>科研支出公示表</h1>
+    <span class="version">版号 {{ s.version }} · 底表版号 {{ s.base_version }}</span>
+  </div>
+  <p class="muted">单位：万元。每格及行列小计按向上/向下取整，总计四舍五入；已锁定院系的公示值与小计保持原值。</p>
+  {% if v.display_ok and v.verified %}
+    <div class="ok-banner">核对通过：各单元格、行小计、列小计与总计横竖加平均一致。</div>
+  {% else %}
+    <div class="flash error">核对未通过：表内明细与合计不一致，请勿对外发布并联系管理员。</div>
+  {% endif %}
+  <div class="table-wrap">
+  <table class="grid">
+    <thead>
+      <tr>
+        <th class="corner">院系 \ 科目</th>
+        {% for c in v.cols %}<th>{{ c.label }}</th>{% endfor %}
+        <th class="total-col">行小计</th>
+        <th class="lock-col">状态</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in v.matrix %}
+      <tr class="{{ 'locked' if row.locked }}">
+        <th class="rowhead">{{ row.label }}{% if row.locked %}<span class="badge">已锁定</span>{% endif %}</th>
+        {% for cell in row.cells %}<td class="num" data-row="{{ row.key }}" data-col="{{ cell.col.key }}">{{ cell.value }}</td>{% endfor %}
+        <td class="num subtotal" data-row-subtotal="{{ row.key }}">{{ row.subtotal }}</td>
+        <td class="lock-cell">
+          {% if row.locked %}
+            <span class="muted">版 {{ row.lock.statement_version }}</span>
+          {% else %}
+            <form method="post" action="{{ url_for('lock', row_key=row.key) }}">
+              <input type="hidden" name="version" value="{{ s.version }}">
+              <button class="small" type="submit">锁定此行</button>
+            </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+    <tfoot>
+      <tr>
+        <th class="rowhead">列小计</th>
+        {% for val in v.col_totals %}<td class="num subtotal" data-col-subtotal="{{ v.cols[loop.index0].key }}">{{ val }}</td>{% endfor %}
+        <td class="num grand" data-grand-total>{{ v.total }}</td>
+        <td class="lock-cell muted">总计</td>
+      </tr>
+    </tfoot>
+  </table>
+  </div>
+  <p class="muted">总计 {{ v.total }} 万元；行小计合计 {{ v.row_sums|sum }}，列小计合计 {{ v.col_sums|sum }}。
+    已锁定 {{ v.locked_count }} 行，未锁定 {{ v.unlocked_count }} 行。</p>
+  <div class="actions">
+    <a class="button" href="{{ url_for('correct_page') }}">更正底表数据</a>
+  </div>
+  {% if s.locks %}
+  <details class="locks">
+    <summary>锁定记录（{{ s.locks|length }} 条，已存 SQLite）</summary>
+    <table class="grid records">
+      <thead>
+        <tr><th>院系</th><th>锁定版号</th><th>公示值（万元）</th><th>行小计</th><th>锁定时间</th></tr>
+      </thead>
+      <tbody>
+        {% for key, lock in s.locks.items() %}
+        <tr>
+          <th class="rowhead">{{ lock.row_label }}</th>
+          <td class="num">{{ lock.statement_version }}</td>
+          <td class="num">{{ lock.cells|join('、') }}</td>
+          <td class="num">{{ lock.subtotal }}</td>
+          <td class="num">{{ lock.locked_at }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </details>
+  {% endif %}
+</section>
+{% endblock %}
